@@ -4,6 +4,9 @@ function out = ldes_dispatch(load_kW, price, outage, sur, cfg)
 % Each step, in priority order:
 %   1) Grid outage      -> battery discharges to serve the load (TPV power permitting).
 %                          Whatever it cannot cover is UNSERVED LOAD. No charging.
+%                          outage(k) is the FRACTION of step k the grid is out (0..1):
+%                          backup runs for that fraction; the rest of the step is
+%                          standby (shutters closed, no charging), a small simplification.
 %   2) price > priceDischarge and energy above the reserve
 %                       -> discharge to offset grid purchases (up to the load; no export
 %                          unless cfg.allowExport), never dipping below the reserve.
@@ -18,6 +21,7 @@ function out = ldes_dispatch(load_kW, price, outage, sur, cfg)
 %   reserveFrac, E0_kWh, EF_t_per_kWh, allowExport
 
 n   = numel(load_kW);  dt = cfg.dt_h;  sc = cfg.scale;
+outage = min(max(double(outage(:)), 0), 1);   % logical masks still work
 Ecap = sur.Ecap_kWh*sc;   Efl = sur.Efloor_kWh*sc;   Eres = cfg.reserveFrac*Ecap;
 eta  = cfg.etaHeater;     Pchmax = cfg.Pcharge_kW;
 
@@ -40,11 +44,16 @@ for k = 1:n
     plo = sc*(tLo(i) + w*(tLo(i+1)-tLo(i)));
     plc = sc*(tLc(i) + w*(tLc(i+1)-tLc(i)));
 
-    x = 0;  pin = 0;
-    if outage(k)                                           % 1) backup
+    x = 0;  pin = 0;  fo = outage(k);
+    if fo > 0                                              % 1) backup for fraction fo of the step
         if pel > 0, x = min(1, load_kW(k)/pel); end
-        Pun(k) = load_kW(k) - x*pel;
-        mode(k) = 2;
+        Pun(k) = max(0, fo*(load_kW(k) - x*pel));          % step-average kW
+        ploss = fo*(x*plo + (1-x)*plc) + (1-fo)*plc;
+        Pel(k) = fo*x*pel;  Pco(k) = fo*x*pco;  Plo(k) = ploss;
+        E = E - (Pel(k) + Pco(k) + ploss)*dt;
+        if E < Efl, E = Efl; end
+        Es(k) = E;  mode(k) = 2;
+        continue
     elseif price(k) > cfg.priceDischarge && E > Eres && pel > 0   % 2) price-driven discharge
         if cfg.allowExport, x = 1; else, x = min(1, load_kW(k)/pel); end
         dOut = pel + pco + plo - plc;                      % extra drain per unit x
@@ -73,12 +82,14 @@ out.Echarge_kWh   = kWh(Pgrid);                            % grid electricity in
 out.chargeCost_USD = sum(Pgrid.*price)*dt;
 out.CO2_t         = cfg.EF_t_per_kWh * out.Echarge_kWh;
 out.unserved_kWh  = kWh(Pun);
-out.outageLoad_kWh = kWh(load_kW(outage));
-out.unservedHours = nnz(Pun > 1e-6)*dt;
+out.outageLoad_kWh = kWh(outage.*load_kW);
+out.outageHours   = kWh(outage);
+out.unservedHours = sum(outage(Pun > 1e-6))*dt;
 out.Eel_kWh       = kWh(Pel);
-out.Eel_backup_kWh = kWh(Pel(outage));
+on                = outage > 0;
+out.Eel_backup_kWh = kWh(Pel(on));
 out.Eel_arbitrage_kWh = out.Eel_kWh - out.Eel_backup_kWh;
-out.avoidedPurchase_USD = sum(Pel(~outage).*price(~outage))*dt;   % grid energy the TPV output displaced
+out.avoidedPurchase_USD = sum(Pel(~on).*price(~on))*dt;   % grid energy the TPV output displaced
 out.Ecool_kWh     = kWh(Pco);
 out.Eins_kWh      = kWh(Plo);
 out.Eheater_kWh   = (1-eta)*out.Echarge_kWh;
